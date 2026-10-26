@@ -61,6 +61,55 @@ Positive SQLCODEs are warnings. Column names can be empty because this query
 description path does not request names. No Zeus runtime, COBOL types, or
 environment variables are involved in the driver.
 
+## Explain access plans
+
+The existing `execute` and `query` API can retrieve Db2 LUW access plans;
+no ODBC or external `db2exfmt` command is needed. Run the complete demo against
+a **development database**:
+
+```sh
+cargo run --example explain
+```
+
+The demo creates a unique schema with a 1,000-row table, prepares Explain
+tables if missing, issues `EXPLAIN PLAN SET QUERYTAG = '...' FOR SELECT ...`,
+and queries `EXPLAIN_OPERATOR`, `EXPLAIN_STREAM`, and `EXPLAIN_STATEMENT`.
+A unique query tag and the complete statement key isolate this plan from others.
+It reports operator types, cumulative estimated costs (timerons), connections
+between operators, estimated row counts, accessed objects, and SQL text.
+`STATEMENT_TEXT` is a CLOB, so the example explicitly casts it to VARCHAR(4000);
+longer statements are truncated in this display.
+
+Verified using this driver on Db2 LUW Community Edition 12.1.5.0:
+
+```text
+SELECT NAME FROM <demo schema>.DEMO WHERE ID = 42
+
+operator   cumulative estimated cost
+RETURN     13.533363342285156
+FETCH      13.533363342285156
+IXSCAN      6.767663478851318
+
+IXSCAN -> FETCH: estimated 1 row
+FETCH -> RETURN: estimated 1 row
+```
+
+These are optimizer estimates, not measured execution times. This verifies
+SQL-based EXPLAIN retrieval, not runtime section actuals or every Explain tool.
+Costs and chosen operators can vary with statistics and database settings.
+
+Db2 looks for dynamic SQL's Explain tables under the **session authorization
+ID**, then SYSTOOLS; changing CURRENT SCHEMA does not select a different set.
+The demo creates missing Explain tables under the session authorization ID via
+`SYSPROC.SYSINSTALLOBJECTS`. It requires privileges to execute that procedure,
+create the demo objects, and populate/read Explain tables. On exit it rolls back
+its captured plan and removes objects it created, preserving pre-existing
+Explain tables. An interrupted run may need manual cleanup.
+
+References: [IBM Explain tables](https://www.ibm.com/docs/en/db2-as-a-service?topic=reference-explain-tables),
+[EXPLAIN statement](https://www.ibm.com/docs/en/db2/12.1.x?topic=statements-explain),
+[SYSINSTALLOBJECTS](https://www.ibm.com/docs/en/db2/12.1.0?topic=views-sysinstallobjects-create-drop-objects).
+
 ## Current scope
 
 This initial driver targets Db2 for LUW (Community Edition). Db2 for z/OS and
