@@ -16,6 +16,9 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
       - run: cargo test --doc
+      - run: cargo clippy --no-default-features --all-targets -- -D warnings
+      - run: cargo test --no-default-features --all-targets
+      - run: cargo test --no-default-features --doc
 
   msrv:
     runs-on: ubuntu-latest
@@ -24,3 +27,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89.0
       - run: cargo test --all-targets
       - run: cargo test --doc
+      - run: cargo test --no-default-features --all-targets

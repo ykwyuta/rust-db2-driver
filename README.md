@@ -1,7 +1,8 @@
 # rust-db2-driver
 
-A synchronous, pure Rust Db2 driver using DRDA directly over TCP. It requires
-no ODBC driver, DSN, IBM client library, or external Rust dependency.
+A synchronous, pure Rust Db2 driver using DRDA directly over TCP or TLS. It
+requires no ODBC driver, DSN, or IBM client library. TLS uses rustls and is
+enabled by default; `default-features = false` removes runtime dependencies.
 Extracted from the working DRDA client in [Zeus](https://github.com/ykwyuta/Zeus);
 see [NOTICE.md](NOTICE.md) for provenance. Licensed under the MIT License.
 
@@ -51,6 +52,11 @@ cargo run --example query -- 'SELECT CURRENT DATE FROM SYSIBM.SYSDUMMY1'
 - `Connection::connect(&Params)` authenticates and opens a database session.
 - `execute(&str)` runs DDL or DML and returns `SqlCa` (affected rows in `errd[2]`).
 - `query(&str)` returns `Rows { columns, rows, sqlca }` and fetches all rows.
+- `execute_params(&str, &[Value])` and `query_params(&str, &[Value])` bind
+  positional `?` markers using DRDA SQLDTA, with no SQL interpolation.
+- `connect_tls(&Params)` verifies the server certificate and hostname;
+  `connect_with_tls(&Params, Arc<rustls::ClientConfig>)` supports private CAs.
+- `cancel_handle()` returns a cloneable handle usable from another thread.
 - `commit()` and `rollback()` explicitly end a transaction; there is no autocommit.
 - `Value` represents NULL, signed integers, exact decimals as strings, floating
   point, text (including dates/times), and binary data.
@@ -58,8 +64,80 @@ cargo run --example query -- 'SELECT CURRENT DATE FROM SYSIBM.SYSDUMMY1'
 I/O and protocol failures return `Err(Error)`. SQL failures return `Ok` with a
 negative `sqlcode`; always inspect the SQLCA, including after commit/rollback.
 Positive SQLCODEs are warnings. Column names can be empty because this query
-description path does not request names. No Zeus runtime, COBOL types, or
-environment variables are involved in the driver.
+description path does not request names. No Zeus runtime or COBOL types are
+required by the driver.
+
+## TLS, parameters, and cancellation
+
+`connect()` retains the existing plain TCP behavior. For TLS, specify the
+server's TLS port in `Params`, then call `Connection::connect_tls(&params)`.
+It verifies the certificate against public roots and the host in `Params`;
+there is no automatic fallback to plain TCP. For a private CA, load its PEM
+certificate into a rustls root store (rustls is re-exported by this crate):
+
+```rust,no_run
+use std::sync::Arc;
+use rust_db2_driver::{Connection, Params, Value, rustls};
+use rustls::pki_types::{CertificateDer, pem::PemObject};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+let params = Params::from_url(&std::env::var("DB2_URL")?)?;
+let mut roots = rustls::RootCertStore::empty();
+for cert in CertificateDer::pem_file_iter("db2-ca.pem")? {
+    roots.add(cert?)?;
+}
+let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+    rustls::crypto::ring::default_provider(),
+))
+.with_safe_default_protocol_versions()?
+.with_root_certificates(roots)
+.with_no_client_auth();
+let mut conn = Connection::connect_with_tls(&params, Arc::new(config))?;
+let rows = conn.query_params(
+    "VALUES (CAST(? AS BIGINT), CAST(? AS VARCHAR(100)))",
+    &[Value::Int(42), Value::Str("こんにちは' ? --".into())],
+)?;
+assert!(rows.sqlca.sqlcode >= 0);
+conn.rollback()?;
+Ok(())
+}
+```
+
+Input values support BIGINT, finite DOUBLE, UTF-8 VARCHAR, VARBINARY, packed
+DECIMAL (up to 31 digits), and NULL. `Value::Null` is transmitted as a nullable
+VARCHAR and converted by Db2 to the target type. Use explicit `CAST(? AS ...)`
+when Db2 cannot infer a marker's SQL type. Marker count/type errors are returned
+in the SQLCA. Each call prepares and executes a statement; there is no reusable
+prepared-statement object. Outbound continuation/LOB parameters are not yet
+supported: SQLDTA payloads over 32757 bytes return an error before execution.
+Parameter markers represent values, not identifiers such as table names.
+
+To cancel a blocking call, obtain a handle before moving the connection:
+
+```rust,no_run
+use rust_db2_driver::{Connection, Params};
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+let params = Params::from_url(&std::env::var("DB2_URL")?)?;
+let mut conn = Connection::connect(&params)?;
+let cancel = conn.cancel_handle();
+let worker = std::thread::spawn(move || conn.query("SELECT * FROM BIG_TABLE"));
+// From a UI event handler or another thread when cancellation is requested:
+cancel.cancel()?;
+let result = worker.join().expect("query worker panicked");
+if let Err(error) = result {
+    assert!(error.is_cancelled());
+}
+Ok(())
+}
+```
+
+Cancellation shuts down this connection's underlying socket, including for
+TLS, and interrupts blocked I/O. It is permanent and idempotent, even if the
+connection is idle. Reconnect afterwards. This is connection abort, not a Db2
+statement-cancel protocol; it does not guarantee immediate server termination.
+Transactions are left to Db2's disconnect handling. In particular, cancellation
+while committing does not determine whether the commit completed. A call that
+already completed may return its result before a concurrent cancellation.
 
 ## Explain access plans
 
@@ -117,13 +195,13 @@ IBM i compatibility has not been validated. It uses the server's existing
 `NULLID.SYSSH200` dynamic SQL package; that package and appropriate database
 permissions must be available.
 
-Connections use unencrypted TCP and DRDA user/password authentication
-(SECMEC 3). TLS and additional authentication methods are not implemented.
-Use only on a trusted network or through a secured tunnel.
+Connections use DRDA user/password authentication (SECMEC 3). Use a TLS
+connection on untrusted networks. Additional authentication methods are not
+implemented. DRDA control strings use CCSID 500, including password punctuation.
 
-There is no parameter binding/prepared statement API, async I/O, connection
-pool, configurable timeout, streaming cursor, or LOB/DECFLOAT support. Do not
-concatenate untrusted input into SQL. Queries buffer their complete results;
+There is no async I/O, connection pool, configurable timeout, streaming cursor,
+or LOB/DECFLOAT support. Use parameter binding for untrusted values.
+Queries buffer their complete results;
 unsupported column types return an error. This is an initial standalone port,
 not a complete implementation of every Db2 type or DRDA feature.
 
@@ -138,6 +216,8 @@ cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 cargo test --doc
+cargo clippy --no-default-features --all-targets -- -D warnings
+cargo test --no-default-features --all-targets
 ```
 
 The Db2 integration test is explicitly ignored by default. Point `DB2_URL`
@@ -147,9 +227,19 @@ at a disposable Db2 LUW test database and run:
 cargo test --test db2 -- --ignored --nocapture
 ```
 
-It checks Unicode, numeric/date/binary values, NULL, multi-block result fetching,
-SQL errors, and commit/rollback. It creates a unique table in the user's schema
+It checks Unicode, numeric/date/binary values, NULL, parameter binding,
+multi-block fetching, SQL errors, transactions, and cancellation of an actual
+server lock wait (confirmed through `MON_GET_APPL_LOCKWAIT` before cancellation).
+The cancellation test requires permission to use that monitoring function.
+It creates unique tables in the user's schema
 and drops it on success; an interrupted or failed run may leave that test table.
 The account needs CREATE TABLE, INSERT, SELECT, DELETE, and DROP permissions.
 CI runs offline unit tests, documentation examples, and checks on Linux,
 Windows, and macOS, plus a Rust 1.89 MSRV job. The real-server test is opt-in.
+
+For a disposable Db2 LUW 12.1.5 instance with TCP and native TLS, see
+[tests/docker/README.md](tests/docker/README.md). Set `DB2_TLS_CA` to its exported
+PEM certificate and point `DB2_URL` at the TLS port to run the same integration
+tests through TLS. Local transport tests generate temporary certificates and
+check private CA trust, hostname mismatch, untrusted certificates, and blocked
+TCP/TLS cancellation without requiring Db2.

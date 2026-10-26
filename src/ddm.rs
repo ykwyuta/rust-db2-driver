@@ -49,6 +49,10 @@ pub mod cp {
     pub const RDBRLLBCK: u16 = 0x200F;
     pub const PKGNAMCSN: u16 = 0x2113;
     pub const SQLSTT: u16 = 0x2414;
+    pub const SQLDTA: u16 = 0x2412;
+    pub const FDODSC: u16 = 0x0010;
+    pub const FDODTA: u16 = 0x147A;
+    pub const OUTEXP: u16 = 0x2111;
     pub const SQLCARD: u16 = 0x2408;
     pub const SQLDARD: u16 = 0x2411;
     pub const QRYDSC: u16 = 0x241A;

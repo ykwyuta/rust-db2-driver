@@ -1,6 +1,7 @@
 //! SQL statements over a DRDA connection: dynamic SQL in the sections of
 //! the NULLID.SYSSH200 package that Db2 provides for dynamic SQL.
 
+use crate::bind::parameter_data;
 use crate::client::{Connection, Error, Result, ebc_padded, hex};
 use crate::ddm::{Dss, Object, cp};
 
@@ -135,6 +136,26 @@ impl Connection {
         Ok(self.reply_sqlca(&r))
     }
 
+    /// Prepares and executes SQL with positional `?` parameters sent as SQLDTA.
+    /// SQL failures, including a marker-count mismatch, are returned in `SqlCa`.
+    pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<SqlCa> {
+        let data = parameter_data(params)?;
+        let pkg = pkgnamcsn(self, 1);
+        let prp = Object::new(cp::PRPSQLSTT).param(cp::PKGNAMCSN, &pkg);
+        let r = self.exchange(&[(prp, vec![sqlstt(sql)])])?;
+        crate::client::check_errors(&r)?;
+        let ca = self.reply_sqlca(&r);
+        if ca.sqlcode < 0 {
+            return Ok(ca);
+        }
+        let cmd = Object::new(cp::EXCSQLSTT)
+            .param(cp::PKGNAMCSN, &pkg)
+            .param(cp::OUTEXP, &[0xF0]);
+        let r = self.exchange(&[(cmd, data)])?;
+        crate::client::check_errors(&r)?;
+        Ok(self.reply_sqlca(&r))
+    }
+
     pub fn commit(&mut self) -> Result<SqlCa> {
         let r = self.exchange(&[(Object::new(cp::RDBCMM), vec![])])?;
         crate::client::check_errors(&r)?;
@@ -150,6 +171,14 @@ impl Connection {
     /// Runs a query and returns all its rows (PRPSQLSTT, OPNQRY, then
     /// CNTQRY until the end of the data).
     pub fn query(&mut self, sql: &str) -> Result<Rows> {
+        self.query_params(sql, &[])
+    }
+
+    /// Runs a query with positional `?` parameters, without SQL interpolation.
+    /// Cast markers in SQL when Db2 cannot infer their types, e.g.
+    /// `VALUES CAST(? AS BIGINT)`. `Null` is sent as a nullable VARCHAR.
+    pub fn query_params(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
+        let data = parameter_data(params)?;
         self.section = if self.section >= 65 || self.section < 2 {
             2
         } else {
@@ -171,7 +200,7 @@ impl Connection {
         let opn = Object::new(cp::OPNQRY)
             .param(cp::PKGNAMCSN, &pkg)
             .param(cp::QRYBLKSZ, &QRYBLKSZ.to_be_bytes());
-        let mut r = self.exchange(&[(opn, vec![])])?;
+        let mut r = self.exchange(&[(opn, data)])?;
         crate::client::check_errors(&r)?;
         let mut rows = Rows::default();
         let Some(rm) = r.iter().find(|d| d.object.cp == cp::OPNQRYRM) else {
@@ -254,6 +283,7 @@ impl Connection {
         rows.rows.clear();
         let mut i = 0;
         while i < data.len() {
+            self.check_cancelled()?;
             match data[i] {
                 // an SQLCA for the row: the end of the data, an error, or
                 // a warning on the row that follows
@@ -326,7 +356,7 @@ pub struct Column {
     pub name: String,
 }
 
-/// A column value.
+/// A SQL input parameter or output column value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -345,8 +375,8 @@ pub struct Rows {
     pub sqlca: SqlCa,
 }
 
-/// The column descriptions of a QRYDSC: its X'76' triplets list the
-/// columns as (type, length) entries.
+/// The column descriptions of a QRYDSC: X'76' and continuation X'7F'
+/// triplets list columns as (type, length) entries.
 fn parse_qrydsc(d: &[u8]) -> Result<Vec<Column>> {
     let mut cols = Vec::new();
     let mut i = 0;
@@ -355,7 +385,7 @@ fn parse_qrydsc(d: &[u8]) -> Result<Vec<Column>> {
         if len < 3 || i + len > d.len() {
             break;
         }
-        if d[i + 1] == 0x76 {
+        if matches!(d[i + 1], 0x76 | 0x7f) {
             let mut k = i + 3;
             while k + 3 <= i + len {
                 let t = d[k];
@@ -525,5 +555,19 @@ mod tests {
                 name: String::new(),
             }
         );
+    }
+
+    #[test]
+    fn query_description_continues_after_84_columns() {
+        let mut d = vec![255, 0x76, 0xd0];
+        for _ in 0..84 {
+            d.extend([0x03, 0, 4]);
+        }
+        d.extend([6, 0x7f, 0, 0x17, 0, 8]);
+        let columns = parse_qrydsc(&d).unwrap();
+        assert_eq!(columns.len(), 85);
+        assert_eq!(columns[84].drda_type, 0x16);
+        assert!(columns[84].nullable);
+        assert_eq!(columns[84].len, 8);
     }
 }

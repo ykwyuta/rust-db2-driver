@@ -1,7 +1,12 @@
 //! A DRDA connection to a Db2 database.
 
-use std::io::{BufReader, Write};
-use std::net::TcpStream;
+use std::io::{BufReader, Read, Write};
+use std::net::{Shutdown, TcpStream};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
 
 use crate::ebcdic;
 
@@ -10,6 +15,17 @@ use crate::ddm::{self, CHAINED, Dss, OBJDSS, Object, RQSDSS, SAME_CORRELATOR, cp
 /// A DRDA protocol or server error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
+
+impl Error {
+    /// Whether the connection was explicitly cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.0 == "connection cancelled; reconnect before issuing more commands"
+    }
+
+    fn cancelled() -> Self {
+        Self("connection cancelled; reconnect before issuing more commands".into())
+    }
+}
 
 impl std::error::Error for Error {}
 
@@ -47,9 +63,86 @@ pub(crate) fn from_ebc(b: &[u8]) -> String {
         .to_string()
 }
 
+trait Transport: Read + Write + Send + Sync {}
+impl<T: Read + Write + Send + Sync> Transport for T {}
+
+struct CancelState {
+    socket: TcpStream,
+    cancelled: AtomicBool,
+}
+
+// Winsock shutdown does not reliably release an already pending recv while the
+// peer is busy executing SQL. Poll the flag on bounded socket waits, underneath
+// both TLS and DSS framing, so partial records stay intact between retries.
+struct CancellableSocket {
+    socket: TcpStream,
+    state: Arc<CancelState>,
+}
+
+impl CancellableSocket {
+    fn retry<T>(
+        &self,
+        mut operation: impl FnMut(&TcpStream) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        loop {
+            if self.state.cancelled.load(Ordering::SeqCst) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "connection cancelled",
+                ));
+            }
+            match operation(&self.socket) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+impl Read for CancellableSocket {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.retry(|mut socket| socket.read(buf))
+    }
+}
+
+impl Write for CancellableSocket {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.retry(|mut socket| socket.write(buf))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.retry(|mut socket| socket.flush())
+    }
+}
+
+/// A thread-safe handle that aborts this connection, including blocked I/O.
+///
+/// Cancellation is permanent, even when called while idle. It closes the TCP
+/// connection (also for TLS); reconnect afterwards. It does not send a Db2
+/// statement-cancel command or guarantee when the server stops execution.
+#[derive(Clone)]
+pub struct CancelHandle(Arc<CancelState>);
+
+impl CancelHandle {
+    pub fn cancel(&self) -> Result<()> {
+        if !self.0.cancelled.swap(true, Ordering::SeqCst) {
+            match self.0.socket.shutdown(Shutdown::Both) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotConnected => (),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
 pub struct Connection {
-    pub(crate) out: TcpStream,
-    pub(crate) inp: BufReader<TcpStream>,
+    inp: BufReader<Box<dyn Transport>>,
+    cancel: CancelHandle,
     correlator: u16,
     pub rdbnam: String,
     /// Data representation of the server (TYPDEFNAM of ACCRDBRM).
@@ -132,10 +225,62 @@ impl Connection {
     pub fn connect(p: &Params) -> Result<Connection> {
         p.validate()?;
         let s = TcpStream::connect((p.host.as_str(), p.port))?;
+        Self::from_stream(p, s, |s| Ok(Box::new(s)))
+    }
+
+    /// Connects with TLS, verifying the server name and a public CA chain.
+    /// Use the server's configured TLS port in `Params`.
+    #[cfg(feature = "tls")]
+    pub fn connect_tls(p: &Params) -> Result<Connection> {
+        let roots =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error(format!("TLS: {e}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        Self::connect_with_tls(p, Arc::new(config))
+    }
+
+    /// Connects using a caller-supplied rustls configuration (e.g. private CAs).
+    /// The host in `Params` is also the certificate verification name.
+    #[cfg(feature = "tls")]
+    pub fn connect_with_tls(p: &Params, config: Arc<rustls::ClientConfig>) -> Result<Connection> {
+        p.validate()?;
+        let name = rustls::pki_types::ServerName::try_from(p.host.clone())
+            .map_err(|_| Error("invalid TLS server name".into()))?;
+        let tls =
+            rustls::ClientConnection::new(config, name).map_err(|e| Error(format!("TLS: {e}")))?;
+        let s = TcpStream::connect((p.host.as_str(), p.port))?;
+        Self::from_stream(p, s, |s| {
+            let mut stream = rustls::StreamOwned::new(tls, s);
+            while stream.conn.is_handshaking() {
+                stream.conn.complete_io(&mut stream.sock)?;
+            }
+            Ok(Box::new(stream))
+        })
+    }
+
+    fn from_stream(
+        p: &Params,
+        s: TcpStream,
+        wrap: impl FnOnce(CancellableSocket) -> Result<Box<dyn Transport>>,
+    ) -> Result<Connection> {
         s.set_nodelay(true)?;
+        s.set_read_timeout(Some(Duration::from_millis(100)))?;
+        s.set_write_timeout(Some(Duration::from_millis(100)))?;
+        let cancel = CancelHandle(Arc::new(CancelState {
+            socket: s.try_clone()?,
+            cancelled: AtomicBool::new(false),
+        }));
         let mut c = Connection {
-            out: s.try_clone()?,
-            inp: BufReader::new(s),
+            inp: BufReader::new(wrap(CancellableSocket {
+                socket: s,
+                state: cancel.0.clone(),
+            })?),
+            cancel,
             correlator: 0,
             rdbnam: p.database.to_ascii_uppercase(),
             server_typdef: String::new(),
@@ -146,6 +291,18 @@ impl Connection {
         c.handshake(p)?;
         c.trace = std::env::var_os("DB2_DRDA_TRACE").is_some();
         Ok(c)
+    }
+
+    /// Obtain this before moving the connection to a worker thread.
+    pub fn cancel_handle(&self) -> CancelHandle {
+        self.cancel.clone()
+    }
+
+    pub(crate) fn check_cancelled(&self) -> Result<()> {
+        if self.cancel.0.cancelled.load(Ordering::SeqCst) {
+            return Err(Error::cancelled());
+        }
+        Ok(())
     }
 
     pub(crate) fn rdbnam_param(&self) -> Vec<u8> {
@@ -160,8 +317,23 @@ impl Connection {
     /// Sends a chain of requests: each a command with its command data
     /// objects. Returns the reply DSSs.
     pub(crate) fn exchange(&mut self, chain: &[(Object, Vec<Object>)]) -> Result<Vec<Dss>> {
+        self.check_cancelled()?;
+        let result = self.exchange_inner(chain);
+        self.check_cancelled()?;
+        result
+    }
+
+    fn exchange_inner(&mut self, chain: &[(Object, Vec<Object>)]) -> Result<Vec<Dss>> {
         let mut buf = Vec::new();
         for (k, (cmd, objs)) in chain.iter().enumerate() {
+            // Outbound DSS continuation segments are not implemented yet.
+            // Reject oversized objects rather than wrap their length fields.
+            if std::iter::once(cmd)
+                .chain(objs)
+                .any(|o| o.data.len() > 32757)
+            {
+                return Err(Error("request object exceeds the 32757-byte limit".into()));
+            }
             let corr = self.next_correlator();
             let last_cmd = k + 1 == chain.len();
             let mut fmt = RQSDSS;
@@ -184,8 +356,8 @@ impl Connection {
         if self.trace {
             eprintln!("DRDA > {}", hex(&buf));
         }
-        self.out.write_all(&buf)?;
-        self.out.flush()?;
+        self.inp.get_mut().write_all(&buf)?;
+        self.inp.get_mut().flush()?;
         let mut replies = Vec::new();
         loop {
             let d = ddm::read_dss(&mut self.inp)?;
@@ -276,6 +448,13 @@ impl Connection {
             return Err(Error("no ACCRDBRM in the reply".into()));
         }
         Ok(())
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // A retained cancellation handle must not keep the session open.
+        let _ = self.cancel.0.socket.shutdown(Shutdown::Both);
     }
 }
 
