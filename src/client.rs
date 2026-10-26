@@ -380,6 +380,7 @@ impl Connection {
     }
 
     fn handshake(&mut self, p: &Params) -> Result<()> {
+        let correlation = correlation_token()?;
         let mut mgrs = Vec::new();
         for (m, l) in [
             (cp::AGENT, 7u16),
@@ -417,7 +418,7 @@ impl Connection {
             .param(cp::PRDID, &ebc("RDB01000"))
             .param(cp::TYPDEFNAM, &ebc("QTDSQLASC"))
             .param(cp::TYPDEFOVR, &ovr.data)
-            .param(cp::CRRTKN, &ebc("RUSTDB2.CONN"));
+            .param(cp::CRRTKN, &correlation);
         let r = self.exchange(&[(secchk, vec![]), (accrdb, vec![])])?;
         check_errors(&r)?;
         for d in &r {
@@ -449,6 +450,32 @@ impl Connection {
         }
         Ok(())
     }
+}
+
+// A DRDA correlation token becomes the server's APPLICATION_ID. A fixed token
+// aliases unrelated sessions, including their UOW/activity event-monitor keys.
+// Use the 19-byte DRDA layout: 8 encoded hex digits, '.', 4 encoded hex digits,
+// then 6 binary bytes. OS entropy avoids reuse across threads, processes,
+// hosts, reconnects and clock adjustments. Failure is returned before login.
+fn correlation_token() -> Result<Vec<u8>> {
+    let mut random = [0; 12];
+    getrandom::fill(&mut random)
+        .map_err(|e| Error(format!("connection identifier entropy: {e}")))?;
+    let mut prefix = format!(
+        "{:08X}.{:04X}",
+        u32::from_be_bytes(random[..4].try_into().unwrap()),
+        u16::from_be_bytes(random[4..6].try_into().unwrap())
+    )
+    .into_bytes();
+    // The leading hex digit in each field must be an SNA-compatible letter.
+    for index in [0, 9] {
+        if prefix[index].is_ascii_digit() {
+            prefix[index] += b'G' - b'0';
+        }
+    }
+    let mut token = ebc(std::str::from_utf8(&prefix).unwrap());
+    token.extend_from_slice(&random[6..]);
+    Ok(token)
 }
 
 impl Drop for Connection {

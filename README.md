@@ -57,6 +57,8 @@ cargo run --example query -- 'SELECT CURRENT DATE FROM SYSIBM.SYSDUMMY1'
 - `connect_tls(&Params)` verifies the server certificate and hostname;
   `connect_with_tls(&Params, Arc<rustls::ClientConfig>)` supports private CAs.
 - `cancel_handle()` returns a cloneable handle usable from another thread.
+- Each connection sends a fresh correlation token from OS entropy, keeping
+  Db2 `APPLICATION_ID` and activity-monitor records separate across sessions.
 - `commit()` and `rollback()` explicitly end a transaction; there is no autocommit.
 - `Value` represents NULL, signed integers, exact decimals as strings, floating
   point, text (including dates/times), and binary data.

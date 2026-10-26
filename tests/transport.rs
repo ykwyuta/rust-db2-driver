@@ -29,7 +29,7 @@ fn reply(io: &mut impl Write, corr: u16, obj: Object) {
     io.flush().unwrap();
 }
 
-fn handshake(io: &mut Box<dyn Io>) {
+fn handshake(io: &mut Box<dyn Io>) -> Vec<u8> {
     let r = chain(io);
     assert_eq!(r[0].object.cp, cp::EXCSAT);
     assert_eq!(r[1].object.cp, cp::ACCSEC);
@@ -37,7 +37,38 @@ fn handshake(io: &mut Box<dyn Io>) {
     let r = chain(io);
     assert_eq!(r[0].object.cp, cp::SECCHK);
     assert_eq!(r[1].object.cp, cp::ACCRDB);
+    let token = r[1].object.get(cp::CRRTKN).unwrap().data.clone();
     reply(io, r[1].correlator, Object::new(cp::ACCRDBRM));
+    token
+}
+
+#[test]
+fn distinct_tokens_are_sent_for_parallel_connections_and_reconnects() {
+    let (listener, p) = listener();
+    let server = thread::spawn(move || {
+        let mut tokens = std::collections::HashSet::new();
+        for _ in 0..16 {
+            let mut io: Box<dyn Io> = Box::new(accept(listener.try_clone().unwrap()));
+            let token = handshake(&mut io);
+            assert_eq!(token.len(), 19);
+            assert_eq!(token[8], 0x4b); // EBCDIC '.' separates the two fields.
+            assert!(tokens.insert(token), "connection reused CRRTKN");
+        }
+    });
+    for _ in 0..2 {
+        let clients = (0..8)
+            .map(|_| {
+                let p = p.clone();
+                thread::spawn(move || Connection::connect(&p).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let connections = clients
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect::<Vec<_>>();
+        drop(connections);
+    }
+    server.join().unwrap();
 }
 
 fn listener() -> (TcpListener, Params) {
