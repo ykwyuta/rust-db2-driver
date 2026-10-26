@@ -38,6 +38,31 @@ fn connection() -> Connection {
 }
 
 #[test]
+#[ignore = "requires DB2_URL pointing to a disposable Db2 LUW database"]
+fn application_ids_are_unique_across_connections_and_reconnects() {
+    let mut connections = vec![];
+    let mut ids = std::collections::HashSet::new();
+    for _ in 0..4 {
+        let mut c = connection();
+        let rows = c.query("VALUES APPLICATION_ID()").unwrap();
+        success(rows.sqlca);
+        let Value::Str(id) = &rows.rows[0][0] else {
+            panic!("missing APPLICATION_ID");
+        };
+        assert!(ids.insert(id.clone()), "duplicate APPLICATION_ID");
+        connections.push(c);
+    }
+    drop(connections);
+    let mut c = connection();
+    let rows = c.query("VALUES APPLICATION_ID()").unwrap();
+    success(rows.sqlca);
+    let Value::Str(id) = &rows.rows[0][0] else {
+        panic!("missing APPLICATION_ID");
+    };
+    assert!(ids.insert(id.clone()), "reconnect reused APPLICATION_ID");
+}
+
+#[test]
 #[ignore = "requires DB2_URL and access to MON_GET_APPL_LOCKWAIT"]
 fn cancels_a_running_lock_wait() {
     use std::{
