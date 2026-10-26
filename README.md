@@ -3,7 +3,7 @@
 A synchronous, pure Rust Db2 driver using DRDA directly over TCP. It requires
 no ODBC driver, DSN, IBM client library, or external Rust dependency.
 Extracted from the working DRDA client in [Zeus](https://github.com/ykwyuta/Zeus);
-see [NOTICE.md](NOTICE.md) for provenance. Licensed GPL-3.0-or-later.
+see [NOTICE.md](NOTICE.md) for provenance. Licensed under the MIT License.
 
 ## Use
 
