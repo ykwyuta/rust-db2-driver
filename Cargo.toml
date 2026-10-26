@@ -1,0 +1,20 @@
+[package]
+name = "rust-db2-driver"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A synchronous, pure Rust Db2 driver using DRDA over TCP"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/ykwyuta/rust-db2-driver"
+readme = "README.md"
+keywords = ["db2", "drda", "database", "sql"]
+categories = ["database"]
+
+# Keep this crate independent when checked out inside another workspace.
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
